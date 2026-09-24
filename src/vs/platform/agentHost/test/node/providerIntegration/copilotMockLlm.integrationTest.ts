@@ -9,7 +9,7 @@
 
 import assert from 'assert';
 import { existsSync } from 'fs';
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { timeout } from '../../../../../base/common/async.js';
 import { join } from '../../../../../base/common/path.js';
@@ -19,6 +19,8 @@ import { ActionType, type ChatResponsePartAction, type ChatToolCallCompleteActio
 import { PROTOCOL_VERSION } from '../../../common/state/protocol/version/registry.js';
 import { buildDefaultChatUri, MessageKind, PendingMessageKind, ResponsePartKind, ROOT_STATE_URI, SessionStatus, ToolCallContributorKind, ToolResultContentType, type ISessionWithDefaultChat, type ToolDefinition } from '../../../common/state/sessionState.js';
 import { ToolCallConfirmationReason } from '../../../common/state/protocol/channels-chat/state.js';
+import type { ResolveCanvasSourceResult } from '../../../common/state/protocol/channels-chat/commands.js';
+import { SessionConfigKey } from '../../../common/sessionConfigKeys.js';
 import { AgentHostSessionReleaseRetryMsEnvVar, AgentHostSessionResidencyLimitEnvVar } from '../../../common/agentService.js';
 import { createProviderSession, dispatchTurn, type IAgentHostProviderTestConfig } from '../providerIntegrationTestHelpers.js';
 import { fetchSessionWithChat, getActionEnvelope, isActionNotification, IServerHandle, startRealServer, stopServer, TestProtocolClient } from '../serverIntegrationTestHelpers.js';
@@ -28,11 +30,16 @@ const COPILOT_CONFIG: IAgentHostProviderTestConfig = {
 	scheme: 'copilotcli',
 	githubToken: 'not-a-real-token',
 };
+const CANVAS_COPILOT_CONFIG: IAgentHostProviderTestConfig = {
+	...COPILOT_CONFIG,
+	sessionConfig: { [SessionConfigKey.AutoApprove]: 'autoApprove' },
+};
 
 const DETACHED_SHELL_SCENARIO_ID = 'detached-shell-idle-release';
 const DETACHED_SHELL_DELAY_MS = 6000;
 const STEERING_OWNER_SCENARIO_ID = 'steering-client-tool-owner';
 const STEERING_RESPONSE_DELAY_MS = 10_000;
+const CANVAS_SCENARIO_ID = 'model-opened-canvas';
 
 function quoteShellArgument(value: string): string {
 	return isWindows ? `'${value.replace(/'/g, '\'\'')}'` : `'${value.replace(/'/g, `'\\''`)}'`;
@@ -73,6 +80,25 @@ suite('Agent Host Provider Integration — Copilot with Mock LLM', function () {
 							}],
 						},
 						{ kind: 'content', chunks: [{ content: 'STEERING_CLIENT_RESULT', delayMs: 0 }] },
+					],
+				},
+			}, {
+				id: CANVAS_SCENARIO_ID,
+				definition: {
+					type: 'multi-turn',
+					turns: [
+						{
+							kind: 'tool-calls',
+							toolCalls: [{
+								toolNamePattern: /^open_canvas$/,
+								arguments: {
+									canvasId: 'proof-canvas',
+									instanceId: 'proof-instance',
+									input: { source: 'integration-test' },
+								},
+							}],
+						},
+						{ kind: 'content', chunks: [{ content: 'Canvas opened.', delayMs: 0 }] },
 					],
 				},
 			}],
@@ -130,6 +156,70 @@ suite('Agent Host Provider Integration — Copilot with Mock LLM', function () {
 		const markdownText = turn?.responseParts.map(p => p.kind === ResponsePartKind.Markdown ? p.content : '').join('\n') ?? ``;
 		assert.ok(markdownText.trim().length > 0, `expected non-empty assistant markdown; got: ${JSON.stringify(markdownText)}`);
 		assert.match(markdownText, new RegExp(`\\b${probeToken}\\b`, 'i'), `expected probe token in assistant markdown; got: ${JSON.stringify(markdownText)}`);
+	});
+
+	test('loads a project extension before the model opens its canvas', async function () {
+		this.timeout(180_000);
+		const workspaceDir = await mkdtemp(`${tmpdir()}/test-mock-canvas`);
+		tempDirs.push(workspaceDir);
+		const extensionDir = join(workspaceDir, '.github', 'extensions', 'proof-canvas');
+		await mkdir(extensionDir, { recursive: true });
+		await writeFile(join(extensionDir, 'extension.mjs'), `
+import { createCanvas, joinSession } from '@github/copilot-sdk/extension';
+await joinSession({
+	canvases: [createCanvas({
+		id: 'proof-canvas',
+		displayName: 'Proof canvas',
+		description: 'Integration-test canvas.',
+		open: ({ instanceId }) => ({
+			url: \`http://127.0.0.1:43119/\${instanceId}\`,
+			title: 'Proof canvas',
+			status: 'ready'
+		})
+	})]
+});
+`, 'utf8');
+
+		const sessionUri = await createProviderSession(client, CANVAS_COPILOT_CONFIG, 'real-sdk-mock-canvas', createdSessions, URI.file(workspaceDir));
+		dispatchTurn(client, sessionUri, 'turn-mock-canvas', `[scenario:${CANVAS_SCENARIO_ID}] Open the available proof canvas.`, 1);
+		const startNotification = await client.waitForNotification(n =>
+			isActionNotification(n, ActionType.ChatToolCallStart)
+			&& (getActionEnvelope(n).action as ChatToolCallStartAction).toolName === 'open_canvas',
+			90_000,
+		);
+		void (getActionEnvelope(startNotification).action as ChatToolCallStartAction);
+		const canvasNotification = await client.waitForNotification(n => {
+			if (!isActionNotification(n, ActionType.ChatCanvasesChanged)) {
+				return false;
+			}
+			const action = getActionEnvelope(n).action as { canvases?: readonly unknown[] };
+			return (action.canvases?.length ?? 0) > 0;
+		}, 90_000);
+		const canvasAction = getActionEnvelope(canvasNotification).action as { canvases?: readonly { instanceId: string; revision: number; availability: string }[] };
+		const canvas = canvasAction.canvases?.[0];
+		assert.ok(canvas);
+		const source = await client.call<ResolveCanvasSourceResult>('resolveCanvasSource', {
+			channel: buildDefaultChatUri(sessionUri),
+			instanceId: canvas.instanceId,
+			revision: canvas.revision,
+		});
+		await client.waitForNotification(n => isActionNotification(n, ActionType.ChatTurnComplete), 90_000);
+
+		assert.deepStrictEqual({
+			canvas: {
+				instanceId: canvas.instanceId,
+				revision: canvas.revision,
+				availability: canvas.availability,
+			},
+			source,
+		}, {
+			canvas: {
+				instanceId: 'proof-instance',
+				revision: 1,
+				availability: 'ready',
+			},
+			source: { url: 'http://127.0.0.1:43119/proof-instance' },
+		});
 	});
 
 	test('routes a client tool after steering to the client that sent the steering message', async function () {
